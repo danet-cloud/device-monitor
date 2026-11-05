@@ -52,10 +52,13 @@ function lanAddresses() {
 }
 
 // Starts the hub. Resolves with { port, token, close } once listening.
-function startHub({ port = 7777, dataDir, rootDir = __dirname, assetDir = rootDir, fixture = false, headlessInvites = false, publicUrl = fixture ? null : process.env.DM_HTTPS_ORIGIN, tlsOptions, proxyCertFile = fixture ? null : process.env.DM_TLS_PROXY_CERT, metadataProvider } = {}) {
+function startHub({ port = 7777, dataDir, rootDir = __dirname, assetDir = rootDir, fixture = false, headlessInvites = false, publicUrl = fixture ? null : process.env.DM_HTTPS_ORIGIN, tlsOptions, proxyCertFile = fixture ? null : process.env.DM_TLS_PROXY_CERT, metadataProvider, tailnetDashboard = false } = {}) {
 let PORT = port;
 const configuredOrigin = transport.origin(publicUrl);
 if (publicUrl && !configuredOrigin) throw new Error('DM_HTTPS_ORIGIN must be a bare HTTPS origin');
+if (tailnetDashboard && (!configuredOrigin || !new URL(configuredOrigin).hostname.endsWith('.ts.net'))) {
+  throw new Error('Tailscale dashboard access requires a configured ts.net HTTPS origin');
+}
 const certPath = !fixture && process.env.DM_TLS_CERT, keyPath = !fixture && process.env.DM_TLS_KEY;
 if (certPath || keyPath) {
   if (!certPath || !keyPath || !configuredOrigin) throw new Error('Set DM_HTTPS_ORIGIN, DM_TLS_CERT and DM_TLS_KEY together');
@@ -306,7 +309,22 @@ async function servedTlsPin(req, dest) {
       !(net.isIP(host) ? cert.checkIP(host) : cert.checkHost(host))) return null;
   return transport.publicKeyPin(cert);
 }
-const principal = req => access.principal(bearer(req), directLocal(req));
+// Optional Serve-authenticated browser access. The listener remains loopback-only;
+// Serve replaces identity headers, and public Funnel traffic has no user identity.
+function trustedTailnetRequest(req) {
+  if (!tailnetDashboard || !LOOPBACK.has(req.socket.remoteAddress) || req.socket.encrypted ||
+      req.headers['x-forwarded-proto'] !== 'https' || audience(req) !== configuredOrigin ||
+      !String(req.headers['tailscale-user-login'] || '').trim() || req.headers['tailscale-funnel-request']) return false;
+  let peer = String(req.headers['x-forwarded-for'] || '').trim().toLowerCase();
+  if (peer.startsWith('::ffff:')) peer = peer.slice(7);
+  if (net.isIPv4(peer)) {
+    const [a, b] = peer.split('.').map(Number);
+    return a === 100 && b >= 64 && b <= 127;
+  }
+  return net.isIPv6(peer) && peer.startsWith('fd7a:115c:a1e0:');
+}
+const principal = req => access.principal(bearer(req), directLocal(req)) ||
+  (trustedTailnetRequest(req) ? { role: 'browser', tailnet: true } : null);
 const isDashboard = who => who && ['root', 'operator', 'client', 'browser'].includes(who.role);
 const lastReport = new Map();
 const downloadsByPeer = new Map();
@@ -495,9 +513,14 @@ const handler = async (req, res) => {
         !(directLocal(req) && req.headers.origin === 'http://' + req.headers.host)) return send(res, 403, { error: 'cross-site request refused' });
     const who = principal(req);
     if (!who && !rateOk(req)) return send(res, 429, { error: 'too many requests' });
-    if (req.method === 'GET' && (p === '/' || p === '/index.html')) return sendHtml(res, 'index.html');
+    if (req.method === 'GET' && (p === '/' || p === '/index.html')) {
+      return sendHtml(res, 'index.html', 200, { TAILNET_DASHBOARD: trustedTailnetRequest(req) ? 'true' : 'false' });
+    }
     if (req.method === 'GET' && p === '/pair') return send(res, 200, 'Paste this complete invitation into Device Monitor → Connect on the computer you want to enroll.', 'text/plain; charset=utf-8');
-    if (req.method === 'GET' && p === '/unlock') return sendHtml(res, 'locked.html');
+    if (req.method === 'GET' && p === '/unlock') {
+      if (trustedTailnetRequest(req)) { res.writeHead(302, { ...sec.BASE_HEADERS, Location: '/', 'Cache-Control': 'no-store' }); return res.end(); }
+      return sendHtml(res, 'locked.html');
+    }
     if (req.method === 'POST' && p === '/api/desktop/tls-proof') {
       if (!routeOrigin.startsWith('https:')) return send(res, 403, {error:'HTTPS required'});
       const body = await readBody(req, 1024);
@@ -564,7 +587,7 @@ const handler = async (req, res) => {
     }
     if (req.method === 'GET' && p === '/api/info') {
       if (!isDashboard(who)) return send(res, 200, { app: 'device-monitor', locked: true });
-      return send(res, 200, { app: 'device-monitor', hostname: os.hostname(), port: PORT, canEnroll:['root','operator'].includes(who.role), canShare:who.role !== 'browser', origin: publicOrigin(), localOrigin: directLocal(req) ? localOrigin() : null });
+      return send(res, 200, { app: 'device-monitor', hostname: os.hostname(), port: PORT, canEnroll:['root','operator'].includes(who.role), canShare:who.role !== 'browser', tailnetDashboard: trustedTailnetRequest(req), origin: publicOrigin(), localOrigin: directLocal(req) ? localOrigin() : null });
     }
     if (req.method === 'POST' && p === '/api/report') {
       if (!who || !['local-agent', 'agent'].includes(who.role)) return send(res, 401, { error: 'Re-enroll this agent to obtain a device credential.' });

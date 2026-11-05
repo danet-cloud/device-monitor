@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-tailnet-dashboard="<!--TAILNET_DASHBOARD-->">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -402,7 +402,8 @@
 
 <script src="/session.js"></script>
 <script>
-if (!nativeDashboard && !sessionStorage.getItem('dm.session')) {
+const tailnetDashboard = document.documentElement.dataset.tailnetDashboard === 'true';
+if (!nativeDashboard && !tailnetDashboard && !sessionStorage.getItem('dm.session')) {
   location.replace('/unlock');
 } else {
 const $ = (s, el = document) => el.querySelector(s);
@@ -1383,7 +1384,7 @@ async function openSettings() {
 }
 let settingsMode = null;
 const signOut = $('#signOut'), revokeSessions = $('#revokeSessions');
-if (signOut) { signOut.hidden = nativeDashboard; signOut.onclick = async () => { await hubFetch('/api/logout',{method:'POST'}); sessionStorage.removeItem('dm.session'); location.replace('/unlock'); }; }
+if (signOut) { signOut.hidden = nativeDashboard || tailnetDashboard; signOut.onclick = async () => { await hubFetch('/api/logout',{method:'POST'}); sessionStorage.removeItem('dm.session'); location.replace('/unlock'); }; }
 if (revokeSessions && nativeDashboard) appApi?.getSettings().then(s => { revokeSessions.hidden = s.mode !== 'host'; });
 if (revokeSessions) revokeSessions.onclick = async () => { if (confirm('Revoke all browser sessions and pending invitations?')) await hubFetch('/api/sessions/revoke',{method:'POST'}); };
 $('#settingsBtn').addEventListener('click', openSettings);

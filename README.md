@@ -57,6 +57,12 @@ An embedded host can provide trusted metadata through `startHub({ metadataProvid
 
 The optional `memAvailable` alert rule uses available GiB on Linux, with fractional `minutes` supported to the nearest second. For example, threshold `10` and minutes `0.5` warn after thirty seconds below 10 GiB and resolve after thirty seconds at or above 10.5 GiB. Reporting gaps over ten seconds reset both persistence windows. Rules must be configured explicitly through the authenticated alerts API; external delivery channels are not enabled automatically. The dashboard shows active memory warnings and one recovery notice.
 
+## Tailscale dashboard without expiring browser sign-in
+
+A loopback-only headless hub behind Tailscale Serve can opt into `startHub({ publicUrl: 'https://your-host.your-tailnet.ts.net:8448', tailnetDashboard: true })`. For this dashboard, Tailscale supplies browser access on every request, with no invitation, browser credential or session expiry. A phone Home Screen shortcut can point at the ordinary dashboard URL. Old `/unlock` links redirect to the dashboard when opened through Serve.
+
+This option is off by default and requires a configured HTTPS `ts.net` origin. It accepts only the exact configured host and port, a loopback proxy connection, HTTPS forwarding, a single Tailscale peer address and a Serve-provided user identity. Direct loopback, LAN, public/Funnel and missing-identity requests retain the existing invitation requirements. Reporting credentials, device enrollment, local operator permissions and cross-origin checks are unchanged. Tailscale network access must remain enabled on the phone.
+
 ## Pushing updates to all your devices
 
 On the PC that hosts the hub, from this folder:
