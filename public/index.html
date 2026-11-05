@@ -624,8 +624,8 @@ function aiHtml(ai) {
     (g.models.length
       ? `<div class="kv ai-list">${g.models.map(m => `<span title="${esc(m.name)}">${esc(m.name)}${m.kind ? ` <small>${esc(m.kind)}</small>` : ''}</span><span>${m.size ? fmtBytes(m.size) : '–'}</span>`).join('')}</div>`
       : '<div class="hint">Model name not available</div>')).join('')
-    : '<div class="hint">No AI models loaded</div>';
-  return `<div class="section"><h4>Loaded models</h4>${body}</div>`;
+    : '<div class="hint">No supported local model services detected</div>';
+  return `<div class="section"><h4>Local model services</h4>${body}</div>`;
 }
 function detailHtml(L) {
   let h = aiHtml(L.ai);

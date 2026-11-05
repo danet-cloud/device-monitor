@@ -84,7 +84,7 @@ disks_json() {   # APFS: report the container (total - available), like Finder d
 # /usr/bin/python3 is only a stub that offers to install developer tools until they are installed.
 PY3="$(command -v python3)"; [ "$PY3" = /usr/bin/python3 ] && ! xcode-select -p >/dev/null 2>&1 && PY3=""
 read -r -d '' AI_PY <<'PY'
-import json, os, re, subprocess, urllib.request
+import json, os, re, shlex, subprocess, urllib.request
 def get(url):
     try:
         with urllib.request.urlopen(url, timeout=1.5) as r: return json.load(r)
@@ -122,6 +122,53 @@ for line in run(['nvidia-smi', '--query-compute-apps=pid,used_memory', '--format
     p = [x.strip() for x in line.split(',')]
     if len(p) == 2 and p[0].isdigit() and re.match(r'^\d+(\.\d+)?$', p[1]): gpu[int(p[0])] = gpu.get(int(p[0]), 0) + int(float(p[1]) * 1048576)
 groups = []
+# MLX on Apple silicon has neither nvidia-smi allocations nor /proc cmdlines.
+# Inspect arguments only for Python/MLX executable candidates, and report only
+# the selected model name. A running server is not proof its weights are loaded.
+def mlx_services():
+    found, seen = [], set()
+    candidates = []
+    for line in run(['/bin/ps', '-axo', 'pid=,comm=']).splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit(): continue
+        exe = os.path.basename(parts[1]).lower()
+        if re.fullmatch(r'python(?:\d+(?:\.\d+)*)?|mlx_lm\.server|mlx_vlm', exe):
+            candidates.append(parts[0])
+    for pid in candidates[:64]:
+        try: argv = shlex.split(run(['/bin/ps', '-ww', '-p', pid, '-o', 'command=']).strip())
+        except ValueError: continue
+        module_at = argv.index('-m') if '-m' in argv else -1
+        # -m must belong to Python, not to an unrelated script's own arguments.
+        python_prefix = module_at >= 1 and all(re.fullmatch(r'-[bBdEIOqRsSuvx]+', a) for a in argv[1:module_at])
+        module = argv[module_at + 1] if python_prefix and len(argv) > module_at + 1 else None
+        entry_at = 1 if len(argv) > 1 and os.path.basename(argv[1]) in ['mlx_lm.server', 'mlx_vlm'] else 0
+        entry = os.path.basename(argv[entry_at]) if argv else ''
+        if module == 'mlx_lm.server' or entry == 'mlx_lm.server':
+            app = 'MLX LM service'
+        elif ((module == 'mlx_vlm' and argv[module_at + 2:module_at + 3] == ['server']) or
+              (entry == 'mlx_vlm' and argv[entry_at + 1:entry_at + 2] == ['server'])):
+            app = 'MLX VLM service'
+        else: continue
+        model = arg(argv, '--model', '--model-path')
+        if not model or model.startswith('-') or len(model) > 4096: continue
+        # ps does not preserve argv boundaries for an unquoted path with spaces.
+        # Avoid presenting a truncated absolute path as a model name.
+        if os.path.exists(model):
+            name = os.path.basename(model.rstrip('/'))
+            names = [name]
+            if re.fullmatch(r'(?:[234568]|16)-?bit|fp16|bf16|int[48]', name, re.I):
+                names.insert(0, os.path.basename(os.path.dirname(model.rstrip('/'))))
+            if any(not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._ -]{0,199}', part) for part in names): continue
+            name = '/'.join(names)
+            if len(name) > 200: continue
+        elif re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,199})?', model) and len(model) <= 200:
+            name = model
+        else: continue
+        if not name or (app, name) in seen: continue
+        seen.add((app, name))
+        found.append({'app': app, 'mem': None, 'models': [{'name': name, 'size': None, 'kind': 'service'}]})
+    return found
+groups.extend(mlx_services())
 j = get('http://127.0.0.1:11434/api/ps')
 if j and j.get('models'):
     groups.append({'app': 'Ollama', 'mem': sum(m.get('size_vram') or 0 for m in j['models']) or None,

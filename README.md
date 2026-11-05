@@ -57,6 +57,10 @@ An embedded host can provide trusted metadata through `startHub({ metadataProvid
 
 The optional `memAvailable` alert rule uses available GiB on Linux, with fractional `minutes` supported to the nearest second. For example, threshold `10` and minutes `0.5` warn after thirty seconds below 10 GiB and resolve after thirty seconds at or above 10.5 GiB. Reporting gaps over ten seconds reset both persistence windows. Rules must be configured explicitly through the authenticated alerts API; external delivery channels are not enabled automatically. The dashboard shows active memory warnings and one recovery notice.
 
+## Local model detection on macOS
+
+The macOS collector also detects running MLX LM/VLM server processes and their configured model names. These appear under **Local model services** with a service label. Process detection does not prove weights are loaded, does not report process RSS as GPU memory, and does not include models hosted on another device or by a cloud provider.
+
 ## Tailscale dashboard without expiring browser sign-in
 
 A loopback-only headless hub behind Tailscale Serve can opt into `startHub({ publicUrl: 'https://your-host.your-tailnet.ts.net:8448', tailnetDashboard: true })`. For this dashboard, Tailscale supplies browser access on every request, with no invitation, browser credential or session expiry. A phone Home Screen shortcut can point at the ordinary dashboard URL. Old `/unlock` links redirect to the dashboard when opened through Serve.
