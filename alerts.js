@@ -19,6 +19,7 @@ const TYPES = {
   cpu:       { label: 'CPU load', threshold: [1, 100], hyst: 5 },
   gpu:       { label: 'GPU load', threshold: [1, 100], hyst: 5 },
   mem:       { label: 'Memory use', threshold: [1, 100], hyst: 3 },
+  memAvailable: { label: 'Available RAM', threshold: [0, 1048576], hyst: 0.5 },
   disk:      { label: 'Disk space used', threshold: [1, 100], hyst: 1 },
   power:     { label: 'Power draw', threshold: [1, 100000], hyst: null },
   dailyCost: { label: 'Electricity cost today', threshold: [0.01, 1e7], hyst: null },
@@ -79,7 +80,7 @@ function validRule(r) {
     threshold = Number(r.threshold);
     if (!Number.isFinite(threshold) || threshold < t.threshold[0] || threshold > t.threshold[1]) return null;
   }
-  const minutes = Math.round(Number(r.minutes) || 0);
+  const minutes = r.type === 'memAvailable' ? Math.round((Number(r.minutes) || 0) * 60) / 60 : Math.round(Number(r.minutes) || 0);
   if (minutes < (r.type === 'offline' ? 1 : 0) || minutes > 1440) return null;
   return { id: typeof r.id === 'string' && /^[a-f0-9]{12}$/.test(r.id) ? r.id : newId(), type: r.type, device, threshold, minutes, enabled: r.enabled !== false };
 }
@@ -173,6 +174,7 @@ class Alerts {
       if (!r.enabled || (r.device !== '*' && r.device !== id)) continue;
       if (r.type === 'offline') { this.resolveOffline(r, id); continue; }
       if (r.type === 'dailyCost') continue;
+      if (r.type === 'memAvailable' && body.monitoring?.enabled === false) { this.state.delete(r.id + '|' + id); continue; }
       const [value, detail] = metric(r.type, body);
       if (value == null) continue;
       this.evaluate(r, id, value, detail);
@@ -182,6 +184,26 @@ class Alerts {
   evaluate(r, id, value, detail) {
     const key = r.id + '|' + id, now = Date.now();
     const st = this.state.get(key) || { since: null, firing: false };
+    if (r.type === 'memAvailable') {
+      // A missing report is not evidence of sustained low RAM or recovery.
+      if (st.last != null && now - st.last > 10000) { st.since = null; st.recoverySince = null; }
+      st.last = now;
+      if (value < r.threshold) {
+        st.recoverySince = null; st.since ??= now;
+        if (!st.firing && now - st.since >= r.minutes * 60e3) {
+          Object.assign(st, {firing:true,firedAt:now,value,detail});
+          this.state.set(key,st); return this.emit(r,id,'firing',value,detail);
+        }
+        if (st.firing) { st.value = value; st.detail = detail; }
+      } else {
+        st.since = null;
+        if (st.firing && value >= r.threshold + TYPES.memAvailable.hyst) {
+          st.recoverySince ??= now;
+          if (now - st.recoverySince >= r.minutes * 60e3) { this.state.delete(key); return this.emit(r,id,'resolved',value,detail); }
+        } else st.recoverySince = null;
+      }
+      this.state.set(key,st); return;
+    }
     const hyst = TYPES[r.type].hyst ?? r.threshold * 0.05;
     if (value > r.threshold) {
       st.since ??= now;
@@ -257,6 +279,7 @@ class Alerts {
     if (v == null) return '';
     if (type === 'cpuTemp' || type === 'gpuTemp') return this.temp(v);
     if (type === 'power') return v >= 1000 ? (v / 1000).toFixed(2) + ' kW' : Math.round(v) + ' W';
+    if (type === 'memAvailable') return v.toFixed(1) + ' GiB';
     if (type === 'dailyCost') { try { return new Intl.NumberFormat('en-US', { style: 'currency', currency: detail?.currency || 'USD' }).format(v); } catch { return v.toFixed(2); } }
     return Math.round(v) + '%';
   }
@@ -264,6 +287,9 @@ class Alerts {
     const name = this.nameOf(id), label = TYPES[r.type].label, limit = this.fmt(r.type, r.threshold, detail);
     const dur = r.minutes ? ` for ${r.minutes} min` : '';
     const clock = t => new Date(t).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+    if (r.type === 'memAvailable') return state === 'firing'
+      ? {title:`${name}: low available RAM`,message:`${this.fmt(r.type,value)} available, below ${limit} for ${Math.round(r.minutes*60)} seconds.`}
+      : {title:`${name}: available RAM recovered`,message:`${this.fmt(r.type,value)} available for ${Math.round(r.minutes*60)} seconds.`};
     if (r.type === 'offline') return state === 'firing'
       ? { title: `${name} is offline`, message: `No reports since ${clock(detail?.since || Date.now())}.` }
       : { title: `${name} is back online`, message: detail?.since ? `It was offline since ${clock(detail.since)}.` : 'Reporting again.' };
@@ -366,6 +392,7 @@ function metric(type, b) {
     case 'cpu': return [b.cpu?.usage ?? null];
     case 'gpu': return [max(gpus.map(g => g.usage))];
     case 'mem': return [b.memory?.total ? b.memory.used / b.memory.total * 100 : null];
+    case 'memAvailable': return [b.platform === 'linux' && b.memory?.total > 0 && b.memory.used != null && b.memory.used <= b.memory.total ? (b.memory.total - b.memory.used) / 2**30 : null];
     case 'power': return [b.powerEst?.watts ?? null];
     case 'disk': {
       let worst = null;

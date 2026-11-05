@@ -47,6 +47,16 @@ Expect it to be within about 20% of a plug-in power meter.
 |---|---|
 | ![24 hours of utilization and temperature history for one device](docs/screenshots/history.png) | ![Electricity use and cost per device over 7 days](docs/screenshots/advanced.png) |
 
+## Memory safety and reporting history
+
+Linux cards show available RAM in GiB. Known devices retain their positions when reporting stops, with last-report age and explicitly labelled last-known readings. A lost dashboard connection also marks readings as last known.
+
+History retains minimum available RAM, minimum guard headroom and actual report counts alongside minute averages. Per-metric observation counts identify partial coverage. Older rows remain readable; missing historical minima and counts are not reconstructed. Model, context, serving-run, guard and monitoring events have a separate thirty-day timeline.
+
+An embedded host can provide trusted metadata through `startHub({ metadataProvider: id => ({ enabled: true, guardBytes: 8 * 2**30, model: 'local-model', contextTokens: 98304, runId: 'run-1', guardState: 'armed' }) })`. Return `null` for unconfigured devices. This callback is local host code, never agent-controlled input. Supported guard states are `armed`, `tripped` and `unknown`; it observes an independently managed guard and never controls the model.
+
+The optional `memAvailable` alert rule uses available GiB on Linux, with fractional `minutes` supported to the nearest second. For example, threshold `10` and minutes `0.5` warn after thirty seconds below 10 GiB and resolve after thirty seconds at or above 10.5 GiB. Reporting gaps over ten seconds reset both persistence windows. Rules must be configured explicitly through the authenticated alerts API; external delivery channels are not enabled automatically. The dashboard shows active memory warnings and one recovery notice.
+
 ## Pushing updates to all your devices
 
 On the PC that hosts the hub, from this folder:

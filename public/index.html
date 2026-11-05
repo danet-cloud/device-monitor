@@ -75,7 +75,27 @@
   @media (max-width: 520px) { main { padding: 12px; grid-template-columns: 1fr; } header { padding: 12px; gap: 10px; } }
 
   .card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 14px; padding: 15px 18px 13px; display: flex; flex-direction: column; gap: 12px; }
-  .card.offline { opacity: 0.55; }
+  .card.offline { border-style: dashed; }
+  .card.offline .gauges, .card.offline .stats { opacity: .5; }
+  .report-state { display: none; padding: 8px 10px; border: 1px solid var(--border); border-radius: 7px; font-size: 12px; color: var(--text-secondary); }
+  .offline .report-state { display: block; }
+  .memory-headroom { border-left: 3px solid var(--mem); padding: 8px 11px; background: var(--surface-2); border-radius: 0 8px 8px 0; }
+  .memory-headroom[hidden] { display: none; }
+  .memory-headroom.warn { border-color: var(--warning); }
+  .memory-headroom.critical { border-color: var(--critical); }
+  .memory-label { color: var(--text-secondary); font-size: 11px; }
+  .memory-available { font-size: 24px; line-height: 1.2; font-weight: 650; font-variant-numeric: tabular-nums; margin: 3px 0; }
+  .memory-available small { font-size: 12px; font-weight: 400; color: var(--text-secondary); }
+  .memory-margin { font-size: 12px; color: var(--text-secondary); }
+  .memory-headroom.warn .memory-margin { color: var(--warning); }
+  .memory-headroom.critical .memory-margin { color: var(--critical); }
+  .memory-model { margin-top: 5px; color: var(--text-muted); font-size: 11px; overflow-wrap: anywhere; }
+  .event-list { margin: 14px 0 0; padding: 0; list-style: none; max-height: 260px; overflow: auto; }
+  .event-list li { display: grid; grid-template-columns: minmax(115px, auto) 1fr; gap: 14px; padding: 8px 0; border-top: 1px solid var(--border); font-size: 12px; }
+  .event-list time { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+  .event-list span { overflow-wrap: anywhere; }
+  @media (max-width: 520px) { .event-list li { grid-template-columns: 1fr; gap: 3px; } }
+
   .card-head { display: flex; align-items: flex-start; gap: 9px; }
   .grip { background: none; border: 0; color: var(--text-muted); padding: 2px 0; margin: 2px -4px 0 -8px; cursor: grab; touch-action: none; line-height: 0; border-radius: 4px; opacity: .5; }
   .card:hover .grip, .grip:focus-visible { opacity: 1; }
@@ -300,6 +320,7 @@
   <span id="legacyText"></span>
   <a class="btn primary" id="legacyLink" target="_blank" rel="noopener">Download update</a>
 </div>
+<div id="memoryNotice" role="status" aria-live="polite" hidden style="margin:12px 0;padding:12px 16px;border:1px solid var(--warning);border-radius:12px"></div>
 <main id="grid"></main>
 <section id="historyView" hidden>
   <div class="hv-bar">
@@ -313,7 +334,8 @@
   <div class="hv-head"><h2 id="hvTitle"></h2><span class="sub" id="hvSub"></span><span class="spacer"></span><button class="btn" id="hvReset" hidden>Reset zoom</button></div>
   <div class="tiles" id="hvTiles"></div>
   <div id="hvCharts"></div>
-  <p class="hint">Hover to inspect · drag across a chart to zoom in · double-click to reset. Shaded bands show the peak within each interval.</p>
+  <section class="hv-chart" aria-labelledby="hvEventsTitle"><h3 id="hvEventsTitle">Model and monitoring events</h3><p class="hint" id="hvEventsHint">Event markers align with the charts above.</p><ol class="event-list" id="hvEvents"></ol></section>
+  <p class="hint">Hover to inspect · drag across a chart to zoom in · double-click to reset. Shaded bands show peaks; the available RAM and guard headroom charts retain recorded lows. Dashed vertical lines mark events.</p>
 </section>
 <section id="advView" hidden>
   <div class="hv-bar">
@@ -419,6 +441,32 @@ function memPair(used, total) {
   const [uv, uu] = u.split(' '), tu = t.split(' ')[1];
   return uu === tu ? `${uv} / ${t}` : `${u} / ${t}`;
 }
+const fmtGiB = b => Number.isFinite(b) ? (b / 1024 ** 3).toFixed(1) + ' GiB' : 'unavailable';
+function isReportStale(d) {
+  return !d.online || d.monitoring?.enabled === false || d.hubDisconnected || !Number.isFinite(d.lastSeen) || Date.now() - d.lastSeen > 15000;
+}
+function reportState(d) {
+  const disabled = d.monitoring?.enabled === false;
+  if (disabled) return 'Monitoring disabled';
+  if (d.hubDisconnected) return 'Hub connection lost';
+  if (isReportStale(d)) return d.lastSeen ? 'No report for ' + Math.max(0, Math.floor((Date.now() - d.lastSeen) / 1000)) + ' seconds' : 'Waiting for first report';
+  return 'Reporting';
+}
+function memorySummary(d) {
+  const memory = d.latest?.memory || {}, monitoring = d.monitoring || {};
+  const linux = (d.latest?.platform || d.platform) === 'linux';
+  const available = linux && Number.isFinite(memory.total) && Number.isFinite(memory.used) && memory.total > 0 && memory.used >= 0 && memory.used <= memory.total ? memory.total - memory.used : null;
+  const guard = Number.isFinite(monitoring.guardBytes) && monitoring.guardBytes > 0 ? monitoring.guardBytes : null;
+  return { available, guard, headroom: available != null && guard != null ? available - guard : null };
+}
+function memoryPanel(d) {
+  const { available, guard, headroom } = memorySummary(d), m = d.monitoring || {};
+  if (available == null) return '';
+  const stale = isReportStale(d);
+  const margin = guard == null ? 'Guard threshold unavailable' : headroom >= 0 ? fmtGiB(headroom) + ' above the ' + fmtGiB(guard) + ' guard' : fmtGiB(-headroom) + ' below the ' + fmtGiB(guard) + ' guard';
+  const model = [m.model, Number.isFinite(m.contextTokens) ? 'Context limit: ' + m.contextTokens.toLocaleString() + ' tokens' : null, m.guardState ? 'Guard: ' + m.guardState : null].filter(Boolean).join(' · ');
+  return `<div class="memory-label">${stale ? 'Last known available RAM' : 'Available RAM'}</div><div class="memory-available">${fmtGiB(available)}${stale ? ' <small>last report</small>' : ''}</div><div class="memory-margin">${margin}</div>${model ? `<div class="memory-model">${esc(model)}</div>` : ''}`;
+}
 function fmtTemp(c) {
   if (c == null) return '–';
   return unit === 'F' ? Math.round(c * 9 / 5 + 32) + '°F' : Math.round(c) + '°C';
@@ -484,6 +532,8 @@ function createCard(id) {
         <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
       </button>
     </div>
+    <div class="report-state" role="status"></div>
+    <div class="memory-headroom" hidden></div>
     <div class="gauges">
       <div class="gauge g-cpu">${gaugeSvg('CPU', 'var(--cpu)')}<div class="gauge-sub"></div></div>
       <div class="gauge g-gpu">${gaugeSvg('GPU', 'var(--gpu)')}<div class="gauge-sub"></div></div>
@@ -498,6 +548,7 @@ function createCard(id) {
     <details><summary>Details</summary><div class="detail-body"></div></details>`;
   const refs = {
     name: $('.name', el), sub: $('.sub', el), stats: $('.stats', el), detail: $('.detail-body', el),
+    reportState: $('.report-state', el), memoryPanel: $('.memory-headroom', el),
     details: $('details', el), canvas: $('canvas', el), tip: $('.tip', el),
     cpu: $('.g-cpu svg', el), gpu: $('.g-gpu svg', el), mem: $('.g-mem svg', el),
     cpuSub: $('.g-cpu .gauge-sub', el), gpuSub: $('.g-gpu .gauge-sub', el), memSub: $('.g-mem .gauge-sub', el),
@@ -520,20 +571,26 @@ function updateCard(id) {
   const d = devices.get(id); if (!d) return;
   const c = cards.get(id) || createCard(id);
   const { el, refs } = c;
-  const L = d.online ? d.latest || {} : zeroed(d.latest || {});
-  el.classList.toggle('offline', !d.online);
+  const L = d.latest || {};  // Stale readings stay explicitly labelled, never replaced with fabricated zeros.
+  const stale = isReportStale(d);
+  el.classList.toggle('offline', stale);
   refs.name.textContent = d.name || d.hostname || id;
   refs.name.title = d.hostname || '';
-  const status = d.online ? (L.uptime ? 'up ' + fmtUptime(L.uptime) : 'online') : 'offline · last seen ' + (d.lastSeen ? ago(d.lastSeen) : 'never');
-  refs.sub.textContent = [d.os || d.platform, status, versionLabel(d)].filter(Boolean).join(' · ');
+  const status = !stale ? (L.uptime ? 'up ' + fmtUptime(L.uptime) : 'online') : reportState(d);
+  refs.reportState.textContent = reportState(d) + '. ' + (d.lastSeen ? 'Last seen ' + ago(d.lastSeen) + '; readings below are from that report.' : 'No readings received yet.');
+  const memory = memorySummary(d);
+  refs.memoryPanel.innerHTML = memoryPanel(d); refs.memoryPanel.hidden = memory.available == null;
+  refs.memoryPanel.classList.toggle('warn', !stale && memory.headroom != null && memory.headroom > 0 && memory.headroom < 2 * 1024 ** 3);
+  refs.memoryPanel.classList.toggle('critical', !stale && memory.headroom != null && memory.headroom <= 0);
+  refs.sub.textContent = [d.os || d.platform, status, !stale && d.lastSeen ? 'last report ' + ago(d.lastSeen) : null, versionLabel(d)].filter(Boolean).join(' · ');
 
   const cpu = L.cpu || {}, mem = L.memory || {}, gpus = L.gpus || [], g = gpus[0] || {};
   setGauge(refs.cpu, cpu.usage);
   setGauge(refs.gpu, gpus.length ? g.usage : null);
   setGauge(refs.mem, mem.total ? mem.used / mem.total * 100 : null);
-  const off = '<span class="hint">offline</span>';
-  refs.cpuSub.innerHTML = d.online ? tempPill(cpu.temp, cpu.tempSource) : off;
-  refs.gpuSub.innerHTML = !gpus.length ? '<span class="hint">no GPU</span>' : d.online ? tempPill(g.temp) : off;
+  const off = '<span class="hint">last report</span>';
+  refs.cpuSub.innerHTML = !stale ? tempPill(cpu.temp, cpu.tempSource) : off;
+  refs.gpuSub.innerHTML = !gpus.length ? '<span class="hint">no GPU</span>' : !stale ? tempPill(g.temp) : off;
   refs.memSub.textContent = mem.total ? memPair(mem.used, mem.total) : '';
 
   const stats = [];
@@ -549,17 +606,6 @@ function updateCard(id) {
 
   if (refs.details.open) refs.detail.innerHTML = detailHtml(L);
   drawChart(id);
-}
-
-// An offline device shows zeros rather than its last reading; only what the hardware is
-// (model names, memory and drive sizes) is kept.
-function zeroed(L) {
-  return { ...L, offline: true, uptime: null, temps: [], fans: [],
-    cpu: { ...L.cpu, usage: 0, temp: null, clockMHz: null }, ai: null,
-    memory: L.memory && { ...L.memory, used: 0 },
-    gpus: (L.gpus || []).map(g => ({ ...g, usage: 0, temp: null, memUsed: 0, power: g.power != null ? 0 : null, clockMHz: null, fan: null })),
-    net: L.net && { rx: 0, tx: 0 },
-    diskIO: L.diskIO && { read: 0, write: 0 } };
 }
 
 const shortCpu = n => (n || '').replace(/\(R\)|\(TM\)|CPU|Processor|@.*$/gi, '').replace(/\s+/g, ' ').trim() || '–';
@@ -706,7 +752,7 @@ function startDrag(e, id) {
     el.animate([{ transform: from }, { transform: 'none' }], { duration: 220, easing: EASE })
       .finished.catch(() => {}).then(() => el.classList.remove('settling'));
     document.body.classList.remove('reordering');
-    const ids = [...$('#grid').children].map(c => c.dataset.id).filter(Boolean).concat([...devices.values()].filter(d => !d.online).sort((a, b) => ((a.order ?? 1e9) - (b.order ?? 1e9)) || (a.name || '').localeCompare(b.name || '')).map(d => d.id));
+    const ids = [...new Set([...$('#grid').children].map(c => c.dataset.id).filter(Boolean))];
     const changed = ids.some((id, i) => devices.get(id)?.order !== i);
     ids.forEach((id, i) => { const d = devices.get(id); if (d) d.order = i; });
     drag = null;
@@ -748,16 +794,13 @@ function maybeReorder() {
 function renderGrid() {
   const grid = $('#grid');
   const list = [...devices.values()].sort((a, b) => ((a.order ?? 1e9) - (b.order ?? 1e9)) || (a.name || '').localeCompare(b.name || ''));
-  const online = list.filter(d => d.online);
-  // Offline devices leave the grid for the compact list below it; they get a fresh card when they're back.
-  for (const [id, c] of cards) if (!devices.get(id)?.online && drag?.id !== id) { c.el.remove(); cards.delete(id); }
+  // Keep known devices in their ordered positions even when reports stop.
+  for (const [id, c] of cards) if (!devices.has(id) && drag?.id !== id) { c.el.remove(); cards.delete(id); }
   if (!list.length) {
     grid.innerHTML = `<div class="empty"><h2>No devices yet</h2><p>Click the <b>+</b> button (Add device) at the top and run the command on each PC you want to monitor.</p></div>`;
-  } else if (!online.length) {
-    grid.innerHTML = `<div class="empty small">All devices are offline.</div>`;
   } else {
     $('.empty', grid)?.remove();
-    online.forEach((d, i) => { const c = cards.get(d.id) || createCard(d.id); if (!drag && grid.children[i] !== c.el) grid.insertBefore(c.el, grid.children[i] || null); updateCard(d.id); });
+    list.forEach((d, i) => { const c = cards.get(d.id) || createCard(d.id); if (!drag && grid.children[i] !== c.el) grid.insertBefore(c.el, grid.children[i] || null); updateCard(d.id); });
   }
   renderOffline(list.filter(d => !d.online));
   const on = list.filter(d => d.online).length;
@@ -812,14 +855,25 @@ $('#offPop').addEventListener('click', async e => {
 });
 
 // ---------- live data ----------
+let memoryAlerts = [], memoryRecovery = null;
+function renderMemoryNotice() {
+  const notice = $('#memoryNotice');
+  const warnings = memoryAlerts.map(e => `<div><strong>${esc(e.title)}</strong> ${esc(e.message)}</div>`);
+  if (memoryRecovery && Date.now() < memoryRecovery.until) warnings.push(`<div><strong>${esc(memoryRecovery.title)}</strong> ${esc(memoryRecovery.message)}</div>`);
+  notice.innerHTML = warnings.join(''); notice.hidden = !warnings.length;
+}
 function connect() {
   const es = new HubEvents();
   es.onmessage = ev => {
+    for (const d of devices.values()) d.hubDisconnected = false;
     const m = JSON.parse(ev.data);
     if (m.type === 'snapshot') {
       devices.clear(); series.clear();
       for (const d of m.devices) { devices.set(d.id, d); if (rangeOf(d.id) === '10m') series.set(d.id, { points: d.history || [], resolution: 2000 }); }
       renderGrid(); loadAllSeries(true);
+      hubFetch('/api/alerts').then(r => r.ok ? r.json() : null).then(value => {
+        if (value) { memoryAlerts = (value.active || []).filter(e => e.type === 'memAvailable'); renderMemoryNotice(); }
+      }).catch(() => {});
       if (!$('#historyView').hidden) renderHvDevices();
     }
     else if (m.type === 'report') {
@@ -830,6 +884,12 @@ function connect() {
       if (!prev || !wasOnline) renderGrid(); else updateCard(m.id);
       advLive();
     }
+    else if (m.type === 'alert' && m.event?.type === 'memAvailable') {
+      memoryAlerts = (m.active || []).filter(e => e.type === 'memAvailable');
+      if (m.event.state === 'resolved') memoryRecovery = {...m.event,until:Date.now()+15000};
+      renderMemoryNotice();
+    }
+    else if (m.type === 'alerts') { memoryAlerts = (m.active || []).filter(e => e.type === 'memAvailable'); renderMemoryNotice(); }
     else if (m.type === 'device') { devices.set(m.device.id, m.device); renderGrid(); if (!$('#historyView').hidden) renderHvDevices(); }
     else if (m.type === 'removed') { devices.delete(m.id); series.delete(m.id); renderGrid(); if (hv.id === m.id && !$('#historyView').hidden) location.hash = '#/'; }
     else if (m.type === 'update') {
@@ -839,14 +899,18 @@ function connect() {
     else if (m.type === 'energySettings') { energy.saved = m.settings; renderPriceRow(); if (!$('#advView').hidden) loadAdv(); }
     else if (m.type === 'order') { for (const [id, o] of Object.entries(m.order)) { const d = devices.get(id); if (d) d.order = o; } renderGrid(); }
     else if (m.type === 'status') {
+      renderMemoryNotice();
       let changed = false;
       for (const [id, on] of Object.entries(m.online)) { const d = devices.get(id); if (d && d.online !== on) { d.online = on; changed = true; } }
       if (changed) { renderGrid(); if (!$('#historyView').hidden) renderHvDevices(); }
-      for (const id of devices.keys()) drawChart(id);  // keep the time axis sliding
+      if (m.monitoring) for (const [id, metadata] of Object.entries(m.monitoring)) { const d = devices.get(id); if (d) d.monitoring = metadata; }
+      for (const id of devices.keys()) updateCard(id);  // refresh report ages and keep the time axis sliding
       if (!changed) renderOffline();   // "last seen" times
     }
   };
   es.onerror = () => {
+    for (const d of devices.values()) d.hubDisconnected = true;
+    for (const id of devices.keys()) updateCard(id);
     $('#summaryText').textContent = 'Reconnecting to hub…'; $('#summaryText').classList.remove('full'); $('#summaryShort').textContent = '';
     hubFetch('/api/info').then(r => r.json()).then(i => { if (i.locked && !nativeDashboard) { sessionStorage.removeItem('dm.session'); location.replace('/unlock'); } }).catch(() => {});
   };
@@ -1002,12 +1066,14 @@ const HV_RANGES = { '1h': 3600e3, '6h': 6 * 3600e3, '24h': 24 * 3600e3, '7d': 7 
 const toF = c => unit === 'F' ? c * 9 / 5 + 32 : c;
 const HV_CHARTS = [
   { title: 'Utilization', max: 100, series: [['cpu', 'CPU', '--cpu'], ['gpu', 'GPU', '--gpu'], ['mem', 'Memory', '--mem']], fmt: v => fmtPct(v), axis: v => v + '%' },
+  { title: 'Available RAM', series: [['memAvailable', 'Available', '--mem'], ['memAvailableMin', 'Lowest recorded', '--gpu']], fmt: fmtGiB, axis: v => (v / 1024 ** 3).toFixed(1) + ' GiB', memory: true },
+  { title: 'Guard headroom', series: [['guardHeadroom', 'Above guard', '--mem'], ['guardHeadroomMin', 'Lowest recorded', '--gpu']], fmt: fmtGiB, axis: v => (v / 1024 ** 3).toFixed(1) + ' GiB', headroom: true },
   { title: 'Temperature', series: [['cpuTemp', 'CPU', '--cpu'], ['gpuTemp', 'GPU', '--gpu']], conv: toF, fmt: v => fmtTemp(v), axis: v => Math.round(v) + '°' },
   { title: 'GPU power', series: [['gpuPower', 'GPU', '--gpu']], fmt: v => Math.round(v) + ' W', axis: v => Math.round(v) + ' W' },
   { title: 'Network', series: [['rx', 'Download', '--cpu'], ['tx', 'Upload', '--gpu']], fmt: fmtRate, axis: v => fmtBytes(v, 0) + '/s' },
   { title: 'Disk I/O', series: [['dr', 'Read', '--cpu'], ['dw', 'Write', '--gpu']], fmt: fmtRate, axis: v => fmtBytes(v, 0) + '/s' },
 ];
-const hv = { id: null, range: store.get('hvRange') || '6h', from: 0, to: 0, zoomed: false, points: [], resolution: 60e3, hoverT: null, drag: null, charts: [], timer: null, seq: 0 };
+const hv = { id: null, range: store.get('hvRange') || '6h', from: 0, to: 0, zoomed: false, points: [], events: [], eventsAvailable: true, resolution: 60e3, hoverT: null, drag: null, charts: [], timer: null, seq: 0 };
 if (!HV_RANGES[hv.range]) hv.range = '6h';
 
 function route() {
@@ -1056,7 +1122,7 @@ function renderHvDevices() {
   $('#hvDevices').innerHTML = list.map(d => `<button data-id="${esc(d.id)}" class="${d.id === hv.id ? 'on' : ''}"><i class="${d.online ? 'on' : ''}"></i>${esc(d.name)}</button>`).join('');
   const d = devices.get(hv.id);
   $('#hvTitle').textContent = d ? d.name : 'Unknown device';
-  $('#hvSub').textContent = d ? [d.os, d.online ? 'online' : 'offline'].filter(Boolean).join(' · ') : '';
+  $('#hvSub').textContent = d ? [d.os, reportState(d)].filter(Boolean).join(' · ') : '';
   for (const b of $('#hvRange').children) b.classList.toggle('on', !hv.zoomed && b.dataset.r === hv.range);
   $('#hvReset').hidden = !hv.zoomed;
 }
@@ -1072,11 +1138,22 @@ async function loadHistory() {
   const seq = ++hv.seq;
   const w = Math.min(1200, Math.max(200, Math.round(($('#hvCharts').clientWidth || 900))));
   try {
-    const r = await (await hubFetch(`/api/history/${encodeURIComponent(hv.id)}?from=${Math.round(hv.from)}&to=${Math.round(hv.to)}&points=${w}`)).json();
+    const query = `from=${Math.round(hv.from)}&to=${Math.round(hv.to)}`;
+    const [r, events] = await Promise.all([
+      hubFetch(`/api/history/${encodeURIComponent(hv.id)}?${query}&points=${w}`).then(r => { if (!r.ok) throw new Error('History unavailable'); return r.json(); }),
+      hubFetch(`/api/events/${encodeURIComponent(hv.id)}?${query}`).then(r => r.ok ? r.json() : null).catch(() => null),
+    ]);
     if (seq !== hv.seq) return;
     hv.points = r.points || []; hv.resolution = r.resolution || 60e3;
-  } catch { hv.points = []; }
-  buildHvCharts(); renderTiles(); drawHv();
+    hv.events = (events?.events || []).filter(e => Number.isFinite(e.t) && Math.abs(e.t) <= 8.64e15 && e.t >= hv.from && e.t <= hv.to && typeof e.title === 'string');
+    hv.eventsAvailable = !!events;
+  } catch { if (seq !== hv.seq) return; hv.points = []; hv.events = []; hv.eventsAvailable = false; }
+  buildHvCharts(); renderTiles(); renderHistoryEvents(); drawHv();
+}
+
+function renderHistoryEvents() {
+  $('#hvEventsHint').textContent = !hv.eventsAvailable ? 'Events are unavailable from this hub.' : hv.events.length ? 'Dashed markers on each chart show these events.' : 'No recorded events in this time range. Earlier events are not reconstructed.';
+  $('#hvEvents').innerHTML = [...hv.events].sort((a, b) => b.t - a.t).map(e => `<li><time datetime="${new Date(e.t).toISOString()}">${esc(new Date(e.t).toLocaleString())}</time><span>${esc(e.title)}</span></li>`).join('');
 }
 
 function renderTiles() {
@@ -1101,13 +1178,24 @@ function renderTiles() {
   add('CPU temp', '--cpu', 'cpuTemp', fmtTemp);
   add('GPU temp', '--gpu', 'gpuTemp', fmtTemp);
   add('GPU power', '--gpu', 'gpuPower', v => Math.round(v) + ' W');
+  const minimum = key => {
+    const recorded = P.map(p => p[key + 'Min'] ?? (p.n === 1 ? p[key] : null)).filter(Number.isFinite);
+    return recorded.length ? Math.min(...recorded) : null;
+  };
+  for (const [key, label] of [['memAvailable', 'Lowest available RAM'], ['guardHeadroom', 'Lowest guard headroom']]) {
+    const value = minimum(key);
+    const coverage = P.every(p => Number.isFinite(p[key + 'N']) && Number.isFinite(p.n)) ? `${P.reduce((n, p) => n + p[key + 'N'], 0).toLocaleString()} of ${P.reduce((n, p) => n + p.n, 0).toLocaleString()} reports include this metric` : 'older data may have incomplete coverage';
+    if (value != null) tiles.push(`<div class="tile" style="--c:var(--mem)"><div class="k">${label}</div><div class="v">${fmtGiB(value)}</div><div class="s">${coverage}</div></div>`);
+  }
+  const countKnown = P.length && P.every(p => Number.isFinite(p.n));
+  if (countKnown) tiles.push(`<div class="tile" style="--c:var(--accent)"><div class="k">Recorded reports</div><div class="v">${P.reduce((n, p) => n + p.n, 0).toLocaleString()}</div><div class="s">reports represented in these points</div></div>`);
   $('#hvTiles').innerHTML = tiles.join('') || '';
 }
 
 function buildHvCharts() {
   const box = $('#hvCharts');
   const present = HV_CHARTS.map(c => ({ ...c, series: c.series.filter(([k]) => hv.points.some(p => p[k] != null)) })).filter(c => c.series.length);
-  if (!present.length) { box.innerHTML = `<div class="hv-chart hv-empty">No history for this time range yet. Data is recorded while the device is online.</div>`; hv.charts = []; return; }
+  if (!present.length) { delete box.dataset.sig; box.innerHTML = `<div class="hv-chart hv-empty">No history for this time range yet. Data is recorded while the device is online.</div>`; hv.charts = []; return; }
   const sig = present.map(c => c.title + c.series.map(s => s[0]).join()).join('|');
   if (box.dataset.sig === sig) { hv.charts.forEach((c, i) => c.cfg = present[i]); return; }
   box.dataset.sig = sig;
@@ -1138,9 +1226,13 @@ function drawHvChart(ch) {
   const P = hv.points;
   let yMin = 0, yMax = cfg.max;
   if (!yMax) {
-    let hi = 0;
+    let hi = cfg.memory ? devices.get(hv.id)?.monitoring?.guardBytes || 0 : 0;
     for (const p of P) for (const [k] of cfg.series) { const v = p[k + 'Max'] ?? p[k]; if (v != null) hi = Math.max(hi, conv(v)); }
     yMax = niceMax(hi * 1.1);
+  }
+  if (cfg.headroom) {
+    const values = P.flatMap(p => cfg.series.map(([k]) => p[k])).filter(Number.isFinite);
+    if (values.length) yMin = Math.min(0, Math.floor(Math.min(...values) / 1024 ** 3) * 1024 ** 3);
   }
   const ch_ = H - PAD.t - PAD.b;
   const y = v => PAD.t + ch_ - (conv(v) - yMin) / (yMax - yMin) * ch_;
@@ -1191,7 +1283,21 @@ function drawHvChart(ch) {
     }
     ctx.stroke();
   }
-  ctx.restore();
+  // Guard threshold is a reference for the selected device's current configuration.
+  const guard = devices.get(hv.id)?.monitoring?.guardBytes;
+  const threshold = cfg.memory && Number.isFinite(guard) ? guard : cfg.headroom ? 0 : null;
+  if (threshold != null && threshold >= yMin && threshold <= yMax) {
+    const py = y(threshold);
+    ctx.strokeStyle = css.getPropertyValue('--critical'); ctx.lineWidth = 1; ctx.setLineDash([5, 4]);
+    ctx.beginPath(); ctx.moveTo(PAD.l, py); ctx.lineTo(W - PAD.r, py); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = css.getPropertyValue('--critical'); ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
+    ctx.fillText(cfg.memory ? 'Current guard: ' + fmtGiB(guard) : 'Guard boundary', W - PAD.r - 4, py - 3);
+  }
+  ctx.strokeStyle = css.getPropertyValue('--accent'); ctx.lineWidth = 1; ctx.setLineDash([2, 4]);
+  for (const event of hv.events) {
+    const px = hvX(event.t, W); ctx.beginPath(); ctx.moveTo(px, PAD.t); ctx.lineTo(px, PAD.t + ch_); ctx.stroke();
+  }
+  ctx.setLineDash([]); ctx.restore();
   // drag selection
   if (hv.drag && hv.drag.x2 != null) {
     const x1 = Math.max(PAD.l, Math.min(hv.drag.x1, hv.drag.x2)), x2 = Math.min(W - PAD.r, Math.max(hv.drag.x1, hv.drag.x2));
@@ -1213,6 +1319,7 @@ function drawHvChart(ch) {
         const peak = best[k + 'Max'] != null && best[k + 'Max'] > best[k] + 0.5 ? ` <span class="hint">peak ${cfg.fmt(best[k + 'Max'])}</span>` : '';
         rows.push(`<div class="row" style="--c:var(${v})">${label} <b>${cfg.fmt(best[k])}</b>${peak}</div>`);
       }
+      for (const event of hv.events.filter(e => Math.abs(e.t - hv.hoverT) <= Math.max(hv.resolution, span / 80))) rows.push(`<div class="hint">${esc(event.title)}</div>`);
       if (rows.length) {
         const res = hv.resolution > 2500 ? ` · ${hv.resolution >= 3600e3 ? Math.round(hv.resolution / 3600e3) + ' h' : Math.round(hv.resolution / 60e3) + ' min'} avg` : '';
         tip.innerHTML = `<div class="t">${new Date(best.t).toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit', second: hv.resolution <= 2500 ? '2-digit' : undefined })}${res}</div>` + rows.join('');

@@ -6,13 +6,22 @@ const path = require('path');
 const crypto = require('crypto');
 const { isValidId } = require('./security');
 
-const FIELDS = ['cpu', 'gpu', 'mem', 'cpuTemp', 'gpuTemp', 'gpuPower', 'power', 'rx', 'tx', 'dr', 'dw'];
+const FIELDS = ['cpu', 'gpu', 'mem', 'memAvailable', 'guardHeadroom', 'cpuTemp', 'gpuTemp', 'gpuPower', 'power', 'rx', 'tx', 'dr', 'dw'];
 const MAX_FIELDS = ['cpu', 'gpu', 'cpuTemp', 'gpuTemp', 'power'];   // also keep the peak within each bucket
+const MIN_FIELDS = ['memAvailable', 'guardHeadroom'];
 const RAW_MS = 60 * 60 * 1000;
 const MINUTE_MS = 60 * 1000;
 const KEEP_MS = 30 * 24 * 60 * 60 * 1000;
 
 const maxKey = f => f + 'Max';
+const minKey = f => f + 'Min';
+const countKey = f => f + 'N';
+const knownCount = n => Number.isSafeInteger(n) && n >= 0;
+// Raw observations are tagged in add(). A legacy minute with no count remains
+// unknown rather than being presented as one report. Its old averages can still
+// participate in approximate legacy charts with the previous unit weight.
+const weight = s => knownCount(s.n) && s.n > 0 ? s.n : 1;
+const fieldWeight = (s, f) => MIN_FIELDS.includes(f) ? (knownCount(s[countKey(f)]) ? s[countKey(f)] : 0) : weight(s);
 const legacyName = id => id.replace(/[^a-zA-Z0-9_-]/g, '_');
 function privateDir(dir) {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -44,34 +53,52 @@ function rows(file, cutoff, stats = {}) {
 function byMinute(points) {
   const minutes = new Map();
   for (const { id, ...p } of points) {
+    p.n = knownCount(p.n) ? p.n : null;
+    for (const f of MIN_FIELDS) {
+      p[f] = Number.isFinite(p[f]) ? p[f] : null;
+      p[minKey(f)] = Number.isFinite(p[minKey(f)]) ? p[minKey(f)] : null;
+      p[countKey(f)] = knownCount(p[countKey(f)]) ? p[countKey(f)] : 0;
+    }
     const old = minutes.get(p.t);
     minutes.set(p.t, old ? merge(old, p) : p);
   }
   return [...minutes.values()].sort((a, b) => a.t - b.t);
 }
 
-// Average `points` into buckets `width` ms wide. Peaks are kept as <field>Max.
+// Average into buckets, keeping extrema and exact report counts where known.
+// Memory coverage counts are separate: legacy rows never acquire fake minima.
 function aggregate(points, width, start) {
   const out = [];
   let cur = null;
   const flush = () => {
     if (!cur) return;
-    const p = { t: cur.t };
+    const p = { t: cur.t, n: cur.countKnown ? cur.count : null };
     for (const f of FIELDS) p[f] = cur.n[f] ? +(cur.sum[f] / cur.n[f]).toFixed(2) : null;
     for (const f of MAX_FIELDS) p[maxKey(f)] = cur.max[f] ?? null;
+    for (const f of MIN_FIELDS) {
+      p[minKey(f)] = cur.min[f] ?? null;
+      p[countKey(f)] = cur.n[f] || 0;
+    }
     out.push(p);
   };
   for (const s of points) {
     const b = start + Math.floor((s.t - start) / width) * width;
-    if (!cur || cur.t !== b) { flush(); cur = { t: b, sum: {}, n: {}, max: {} }; }
+    if (!cur || cur.t !== b) { flush(); cur = { t: b, sum: {}, n: {}, max: {}, min: {}, count: 0, countKnown: true }; }
+    if (knownCount(s.n)) cur.count += s.n;
+    else cur.countKnown = false;
     for (const f of FIELDS) {
       const v = s[f];
-      if (v == null) continue;
-      cur.sum[f] = (cur.sum[f] || 0) + v; cur.n[f] = (cur.n[f] || 0) + 1;
+      const n = fieldWeight(s, f);
+      if (!Number.isFinite(v) || !n) continue;
+      cur.sum[f] = (cur.sum[f] || 0) + v * n; cur.n[f] = (cur.n[f] || 0) + n;
     }
     for (const f of MAX_FIELDS) {
       const v = s[maxKey(f)] ?? s[f];
       if (v != null && (cur.max[f] == null || v > cur.max[f])) cur.max[f] = v;
+    }
+    for (const f of MIN_FIELDS) {
+      const v = s[minKey(f)];
+      if (Number.isFinite(v) && fieldWeight(s, f) > 0 && (cur.min[f] == null || v < cur.min[f])) cur.min[f] = v;
     }
   }
   flush();
@@ -79,19 +106,25 @@ function aggregate(points, width, start) {
 }
 
 // Combine two points for the same minute (e.g. one flushed at hub shutdown, one after restart),
-// weighting averages by their sample counts. Rows written before counts were stored count as 1.
+// Legacy rows without counts retain an unknown total. Memory averages and
+// minima use only their explicitly counted observations.
 function merge(a, b) {
-  const na = a.n || 1, nb = b.n || 1;
   const p = { t: a.t };
   for (const f of FIELDS) {
-    const x = a[f], y = b[f];
-    p[f] = x == null ? y ?? null : y == null ? x : +((x * na + y * nb) / (na + nb)).toFixed(2);
+    const na = Number.isFinite(a[f]) ? fieldWeight(a, f) : 0;
+    const nb = Number.isFinite(b[f]) ? fieldWeight(b, f) : 0;
+    p[f] = na + nb ? +(((na ? a[f] * na : 0) + (nb ? b[f] * nb : 0)) / (na + nb)).toFixed(2) : null;
   }
   for (const f of MAX_FIELDS) {
     const x = a[maxKey(f)], y = b[maxKey(f)];
     p[maxKey(f)] = x == null ? y ?? null : y == null ? x : Math.max(x, y);
   }
-  p.n = na + nb;
+  for (const f of MIN_FIELDS) {
+    const values = [a, b].filter(s => fieldWeight(s, f) > 0 && Number.isFinite(s[minKey(f)])).map(s => s[minKey(f)]);
+    p[minKey(f)] = values.length ? Math.min(...values) : null;
+    p[countKey(f)] = fieldWeight(a, f) + fieldWeight(b, f);
+  }
+  p.n = knownCount(a.n) && knownCount(b.n) ? a.n + b.n : null;
   return p;
 }
 
@@ -161,6 +194,13 @@ class HistoryStore {
   }
 
   add(id, sample) {
+    sample = { ...sample, n: 1 };
+    for (const f of MIN_FIELDS) {
+      const valid = Number.isFinite(sample[f]);
+      sample[f] = valid ? sample[f] : null;
+      sample[minKey(f)] = valid ? sample[f] : null;
+      sample[countKey(f)] = valid ? 1 : 0;
+    }
     const raw = this.raw.get(id) || (this.raw.set(id, []), this.raw.get(id));
     const last = raw[raw.length - 1];
     if (last && sample.t - last.t < 1000) return;
@@ -203,9 +243,8 @@ class HistoryStore {
   // 1-minute points covering [from, to], including the current unfinished minute.
   minutePoints(id, from, to = Date.now()) {
     const mins = (this.minutes.get(id) || []).filter(p => p.t >= from && p.t <= to);
-    const lastMin = mins.length ? mins[mins.length - 1].t : -Infinity;
-    const tail = (this.raw.get(id) || []).filter(s => s.t >= lastMin + MINUTE_MS && s.t >= from && s.t <= to);
-    return mins.concat(aggregate(tail, MINUTE_MS, Math.floor(from / MINUTE_MS) * MINUTE_MS));
+    const tail = (this.pending.get(id)?.samples || []).filter(s => s.t >= from && s.t <= to);
+    return byMinute(mins.concat(aggregate(tail, MINUTE_MS, Math.floor(from / MINUTE_MS) * MINUTE_MS)));
   }
 
   // Points covering [from, to], at most ~maxPoints, using raw data when it's fine-grained enough.
@@ -217,8 +256,21 @@ class HistoryStore {
     if (width < MINUTE_MS) {
       // Fine-grained: raw samples, with minute data filling in before raw starts (e.g. right after a restart).
       const rawStart = raw.length ? raw[0].t : Infinity;
-      const older = (this.minutes.get(id) || []).filter(p => p.t >= from && p.t + MINUTE_MS <= rawStart);
-      const fine = width <= 2000 ? raw : aggregate(raw, width, from);
+      const older = (this.minutes.get(id) || []).filter(p => p.t >= from && p.t <= to && p.t < rawStart);
+      const boundary = older[older.length - 1];
+      let fineRaw = raw;
+      // A restart can split one minute between disk and the new raw series.
+      // Keep that complete minute once, including its uncommitted tail, rather
+      // than dropping its pre-restart dip or double-counting the new reports.
+      if (boundary && boundary.t + MINUTE_MS > rawStart) {
+        const pend = this.pending.get(id);
+        if (pend?.minute === boundary.t) {
+          const [tail] = aggregate(pend.samples.filter(s => s.t <= to), MINUTE_MS, pend.minute);
+          if (tail) older[older.length - 1] = merge(boundary, tail);
+        }
+        fineRaw = raw.filter(s => s.t >= boundary.t + MINUTE_MS);
+      }
+      const fine = width <= 2000 ? fineRaw : aggregate(fineRaw, width, from);
       points = older.concat(fine);
       resolution = older.length ? MINUTE_MS : Math.max(2000, width);
     } else {

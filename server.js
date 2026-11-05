@@ -14,6 +14,7 @@ const net = require('net');
 const { startAgent } = require('./agent-runner');
 const discovery = require('./discovery');
 const { HistoryStore } = require('./history');
+const { MonitoringStore, normalizeMonitoring } = require('./monitoring');
 const power = require('./power');
 const { Alerts } = require('./alerts');
 const { readJson, writeJson } = require('./safe-json');
@@ -51,7 +52,7 @@ function lanAddresses() {
 }
 
 // Starts the hub. Resolves with { port, token, close } once listening.
-function startHub({ port = 7777, dataDir, rootDir = __dirname, assetDir = rootDir, fixture = false, headlessInvites = false, publicUrl = fixture ? null : process.env.DM_HTTPS_ORIGIN, tlsOptions, proxyCertFile = fixture ? null : process.env.DM_TLS_PROXY_CERT } = {}) {
+function startHub({ port = 7777, dataDir, rootDir = __dirname, assetDir = rootDir, fixture = false, headlessInvites = false, publicUrl = fixture ? null : process.env.DM_HTTPS_ORIGIN, tlsOptions, proxyCertFile = fixture ? null : process.env.DM_TLS_PROXY_CERT, metadataProvider } = {}) {
 let PORT = port;
 const configuredOrigin = transport.origin(publicUrl);
 if (publicUrl && !configuredOrigin) throw new Error('DM_HTTPS_ORIGIN must be a bare HTTPS origin');
@@ -119,6 +120,14 @@ for (const [id, d] of Object.entries(readJson(DEVICES_FILE, {}))) if (sec.isVali
 // id -> { latest } (memory only); metric history lives in the HistoryStore
 const live = Object.create(null);
 const history = new HistoryStore(DATA_DIR, Object.keys(registry));
+const monitoring = new MonitoringStore(DATA_DIR);
+function metadata(id) {
+  try {
+    const value = typeof metadataProvider === 'function' ? normalizeMonitoring(metadataProvider(id)) : null;
+    monitoring.observe(id, value);
+    return value;
+  } catch { return null; }
+}
 const commands = new Map();   // id -> [{ id, action, t }] waiting for the device's next report
 const procWatch = new Map();  // id -> time until which the device should send its processes
 
@@ -133,6 +142,7 @@ function deviceView(id) {
   const l = live[id] || {};
   return {
     ...reg,
+    monitoring: metadata(id),
     online: Date.now() - (reg.lastSeen || 0) < OFFLINE_MS,
     latest: l.latest || null,
     history: history.recent(id, LIVE_HISTORY_MS),
@@ -189,7 +199,7 @@ async function streamDashboard(req, res) {
 }
 const statusTimer = setInterval(() => {
   // Heartbeat + lets clients notice devices that went offline.
-  broadcast({ type: 'status', online: Object.fromEntries(Object.keys(registry).map(id => [id, Date.now() - (registry[id].lastSeen || 0) < OFFLINE_MS])) });
+  broadcast({ type: 'status', online: Object.fromEntries(Object.keys(registry).map(id => [id, Date.now() - (registry[id].lastSeen || 0) < OFFLINE_MS])), monitoring: Object.fromEntries(Object.keys(registry).map(id => [id, metadata(id)])) });
 }, 3000);
 
 // ---- Helpers --------------------------------------------------------------
@@ -317,6 +327,8 @@ function handleReport(raw, signingKey) {
   const id = raw.id;
   if (!registry[id] && Object.keys(registry).length >= MAX_DEVICES) throw new Error('too many devices');
   const body = sec.normalizeReport(raw);
+  const trusted = metadata(id);
+  body.monitoring = trusted;
   const now = Date.now();
   const nextOrder = () => Math.max(-1, ...Object.values(registry).map(r => r.order ?? -1)) + 1;
   const reg = registry[id] || (registry[id] = { id, name: body.hostname || id, firstSeen: now, order: nextOrder() });
@@ -342,6 +354,8 @@ function handleReport(raw, signingKey) {
     cpu: body.cpu?.usage ?? null,
     gpu: g.usage ?? null,
     mem: body.memory?.total ? (body.memory.used / body.memory.total) * 100 : null,
+    memAvailable: body.platform === 'linux' && body.memory?.total > 0 && body.memory.used != null && body.memory.used <= body.memory.total ? body.memory.total - body.memory.used : null,
+    guardHeadroom: body.platform === 'linux' && body.memory?.total > 0 && body.memory.used != null && body.memory.used <= body.memory.total && trusted?.guardBytes ? body.memory.total - body.memory.used - trusted.guardBytes : null,
     cpuTemp: body.cpu?.temp ?? null,
     gpuTemp: g.temp ?? null,
     gpuPower: g.power ?? null,
@@ -351,7 +365,8 @@ function handleReport(raw, signingKey) {
   };
   history.add(id, sample);
   saveRegistry();
-  broadcast({ type: 'report', id, device: { ...reg, online: true, latest: body }, sample });
+  const recordedSample = history.recent(id, 10000).at(-1) || sample;
+  broadcast({ type: 'report', id, device: { ...reg, monitoring: trusted, online: true, latest: body }, sample: recordedSample });
   if (body.actionResult) broadcast({ type: 'actionResult', id, name: reg.name, result: body.actionResult });
   alerts.onReport(id, body);
 
@@ -388,7 +403,10 @@ function costToday(id) {
   return { cost, currency: config.energy.currency };
 }
 const alerts = new Alerts({
-  dataDir: DATA_DIR, broadcast, costToday, hubUrl: preferredHubUrl, external: !fixture,
+  dataDir: DATA_DIR, broadcast: message => {
+    if (message.type === 'alert' && message.event?.type === 'memAvailable') monitoring.add(message.event.device, 'memory', message.event.title);
+    broadcast(message);
+  }, costToday, hubUrl: preferredHubUrl, external: !fixture,
   devices: () => Object.keys(registry).map(id => ({ id, name: registry[id].name, online: Date.now() - (registry[id].lastSeen || 0) < OFFLINE_MS, lastSeen: registry[id].lastSeen })),
 });
 
@@ -641,6 +659,15 @@ const handler = async (req, res) => {
       if (from >= to) return send(res, 400, { error: 'bad range' });
       return send(res, 200, history.query(hid, from, to, points));
     }
+    const em = p.match(/^\/api\/events\/([^/]+)$/);
+    const eid = em && deviceFromPath(em[1]);
+    if (req.method === 'GET' && eid) {
+      const number = key => { const raw = url.searchParams.get(key); return raw != null && Number.isFinite(Number(raw)) ? Number(raw) : null; };
+      const to = number('to') ?? Date.now();
+      const from = number('from') ?? to - 86400e3;
+      if (from >= to || to - from > 32 * 86400e3) return send(res, 400, {error:'bad range'});
+      return send(res, 200, {events:monitoring.query(eid,from,to)});
+    }
     const pm = p.match(/^\/api\/devices\/([^/]+)\/(processes|action)$/);
     const pid = pm && deviceFromPath(pm[1]);
     if (pid && pm[2] === 'processes' && req.method === 'GET') {
@@ -678,7 +705,7 @@ const handler = async (req, res) => {
       }
       if (req.method === 'DELETE') {
         access.revoke(id); lastReport.delete(id);
-        delete registry[id]; delete live[id]; history.remove(id); alerts.removeDevice(id); commands.delete(id); procWatch.delete(id);
+        delete registry[id]; delete live[id]; history.remove(id); monitoring.remove(id); alerts.removeDevice(id); commands.delete(id); procWatch.delete(id);
         saveRegistry();
         broadcast({ type: 'removed', id });
         return send(res, 200, { ok: true });
@@ -696,7 +723,7 @@ const secureServer = tlsOptions ? https.createServer(tlsOptions, handler) : null
 function close() {
   if (saveTimer) { clearTimeout(saveTimer); writeJson(DEVICES_FILE, registry); }
   access.close(); alerts.close(); clearInterval(remoteTimer); clearInterval(rateTimer); downloadsWatch?.close();
-  clearTimeout(watchTimer); history.close(); clearInterval(statusTimer);
+  clearTimeout(watchTimer); history.close(); monitoring.close(); clearInterval(statusTimer);
   for (const res of clients.keys()) res.destroy();
   for (const listener of [server, secureServer]) if (listener) { listener.close(); listener.closeAllConnections(); }
 }
